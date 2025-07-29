@@ -16,6 +16,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import List, Optional
 import re
+import bcrypt
 
 
 class Role(str, Enum):
@@ -74,7 +75,7 @@ class Transaction:
 @dataclass
 class User:
     """
-    Учётная запись + кошелёк.
+    Учётная запись.
 
     Attributes:
         id (int): Идентификатор пользователя.
@@ -82,21 +83,21 @@ class User:
         email (str): Адрес электронной почты.
         password (str): Хэш пароля.
         role (Role): USER или ADMIN.
-        _balance (Decimal): Текущий баланс в кредитах.
-        transactions (List[Transaction]): История операций.
+        wallet (Wallet): Кошелек пользователя.
     """
     id: int
     username: str
     email: str
     password: str
     role: Role = Role.USER
-    _balance: Decimal = Decimal("0")
-    transactions: List[Transaction] = field(default_factory=list)
+    wallet: Optional[Wallet] = None
 
 
     def __post_init__(self) -> None:
         self._validate_email()
         self._validate_password()
+        if self.wallet is None:
+            self.wallet = Wallet(user_id=self.id)
 
     def _validate_email(self) -> None:
         if not re.fullmatch(r"^[\w\.-]+@[\w\.-]+\.\w+$", self.email):
@@ -106,23 +107,30 @@ class User:
         if len(self.password) < 8:
             raise ValueError("Password must be ≥ 8 chars")
 
+    @staticmethod
+    def hash_password(password: str) -> str:
+        """Хеширует пароль с использованием bcrypt."""
+        salt = bcrypt.gensalt()
+        hashed = bcrypt.hashpw(password.encode('utf-8'), salt)
+        return hashed.decode('utf-8')
+
+    def verify_password(self, password: str) -> bool:
+        """Проверяет соответствие пароля хешу."""
+        return bcrypt.checkpw(password.encode('utf-8'), self.password.encode('utf-8'))
+
 
     @property
     def balance(self) -> Decimal:
         """Текущий баланс пользователя (read‑only)."""
-        return self._balance
-
-    def _add_tx(self, tx: Transaction) -> None:
-        """Добавляет транзакцию в историю и пересчитывает баланс."""
-        pass
+        return self.wallet.balance if self.wallet else Decimal("0")
 
     def credit(self, amount: int | Decimal, ref: str = "topup") -> Transaction:
         """Зачисление средств."""
-        pass
+        return self.wallet.credit(amount, ref)
 
     def debit(self, amount: int | Decimal, ref: str) -> Transaction:
         """Списание средств. Бросает ValueError при нехватке баланса."""
-        pass
+        return self.wallet.debit(amount, ref)
 
 
 class Admin(User):
@@ -136,7 +144,63 @@ class Admin(User):
     def credit_user(self, other: User, amount: int | Decimal,
                     note: str = "admin_topup") -> Transaction:
         """Начисляет кредиты другому пользователю от имени администратора."""
-        pass
+        return other.credit(amount, note)
+
+
+@dataclass
+class Wallet:
+    """
+    Кошелек пользователя для управления балансом и транзакциями.
+
+    Attributes:
+        user_id (int): ID пользователя, которому принадлежит кошелек.
+        _balance (Decimal): Текущий баланс в кредитах.
+        transactions (List[Transaction]): История операций.
+    """
+    user_id: int
+    _balance: Decimal = Decimal("0")
+    transactions: List[Transaction] = field(default_factory=list)
+
+    @property
+    def balance(self) -> Decimal:
+        """Текущий баланс (read-only)."""
+        return self._balance
+
+    def _add_tx(self, tx: Transaction) -> None:
+        """Добавляет транзакцию в историю и пересчитывает баланс."""
+        self.transactions.append(tx)
+        if tx.tx_type == TxType.CREDIT:
+            self._balance += tx.amount
+        elif tx.tx_type == TxType.DEBIT:
+            self._balance -= tx.amount
+
+    def credit(self, amount: int | Decimal, ref: str = "topup") -> Transaction:
+        """Зачисление средств."""
+        amount = Decimal(str(amount))
+        tx = Transaction(
+            id=len(self.transactions) + 1,
+            user_id=self.user_id,
+            tx_type=TxType.CREDIT,
+            amount=amount
+        )
+        self._add_tx(tx)
+        return tx
+
+    def debit(self, amount: int | Decimal, ref: str) -> Transaction:
+        """Списание средств. Бросает ValueError при нехватке баланса."""
+        amount = Decimal(str(amount))
+        if self._balance < amount:
+            raise ValueError(f"Insufficient balance: {self._balance} < {amount}")
+        
+        tx = Transaction(
+            id=len(self.transactions) + 1,
+            user_id=self.user_id,
+            tx_type=TxType.DEBIT,
+            amount=amount
+        )
+        self._add_tx(tx)
+        return tx
+
 
 
 @dataclass
@@ -180,7 +244,8 @@ class Model:
         self.price_per_page = price_per_page
 
     def predict(self, text: str) -> str:
-        pass
+        """Обрабатывает текст через ML-модель и возвращает результат."""
+        return f"Processed by {self.name}: {text[:50]}..."
 
 
 @dataclass
@@ -230,16 +295,23 @@ class MLJob:
 
     def start(self) -> None:
         """Помечает задачу как RUNNING и ставит started_at."""
-        pass
+        self.status = JobStatus.RUNNING
+        self.started_at = datetime.utcnow()
 
     def finish_ok(self, summary: str,
                   clauses: List[RiskClause], score: float) -> None:
         """Финализирует задачу со статусом DONE."""
-        pass
+        self.status = JobStatus.DONE
+        self.summary_text = summary
+        self.risk_clauses = clauses
+        self.risk_score = score
+        self.finished_at = datetime.utcnow()
 
     def finish_error(self, msg: str) -> None:
         """Финализирует задачу со статусом ERROR."""
-        pass
+        self.status = JobStatus.ERROR
+        self.summary_text = f"Error: {msg}"
+        self.finished_at = datetime.utcnow()
 
 
     @classmethod
@@ -257,9 +329,56 @@ class MLJob:
         Returns:
             Экземпляр MLJob со статусом QUEUED.
         """
-        pass
+        cost = Decimal(str(document.pages * model.price_per_page))
+        user.debit(cost, f"ML processing: {document.filename}")
+        
+        job = cls(
+            id=1,  # в реальном приложении должно генерироваться
+            document=document,
+            model=model,
+            summary_depth=depth,
+            used_credits=cost
+        )
+        return job
 
 
 if __name__ == "__main__":
-    pass
+    # Создание пользователя    
+    user = User(
+        id=1, 
+        username="karpov", 
+        email="karpov@jurist.ru",
+        password=User.hash_password("password12312")
+    )
+    print(f"Создан пользователь: {user.username}, баланс: {user.balance}")
+    
+    # Пополнение счета
+    user.credit(500, "initial_payment")
+    print(f"После пополнения баланс: {user.balance}")
+    
+    # Создание документа
+    document = Document(
+        id=1,
+        user_id=user.id,
+        filename="contract_supply.pdf", 
+        raw_text="Договор образовательных услуг karpov.courses",
+        pages=8,
+        language="RU"
+    )
+    print(f"Загружен документ: {document.filename}, страниц: {document.pages}")
+
+
+    admin = Admin(2, "admin", "admin@lawfirm.ru", User.hash_password("admin_pass"))
+    admin.credit_user(user, 200, "bonus")
+    print(f"Админ начислил бонус, баланс пользователя: {user.balance}")
+    
+    # Создание ML-модели
+    model = Model("Legal-Analyzer-RU", price_per_page=3)
+    print(f"Модель: {model.name}, цена за страницу: {model.price_per_page}")
+    
+
+
+    
+
+    
 
